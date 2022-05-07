@@ -1,0 +1,102 @@
+Parameters:
+  AlertsTopicArn:
+    Type: AWS::SSM::Parameter::Value<String>
+Resources:            
+  AlertsLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: AlertsLambdaRole
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+        - 
+          Effect: "Allow"
+          Principal: 
+            Service: 
+              - "lambda.amazonaws.com"
+          Action: 
+            - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+  RolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "allowAssumeRole"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action:
+              - "ssm:GetParametersByPath"
+              - "ssm:GetParameter"
+              - "ssm:DescribeParameters"
+              - "ssm:GetParameters"
+            Resource: "*"
+          - Effect: "Allow"
+            Action: "sns:Publish"
+            Resource: "*"
+          - Effect: "Allow"
+            Action: "sts:AssumeRole"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "logs:PutSubscriptionFilter"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "iam:PassRole"
+            Resource: "*"
+      Roles: 
+        - !Ref "AlertsLambdaRole"
+  AlertlambdaFun: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: PwExpiryAlertLambda
+      Code: 
+        ZipFile: |
+          import gzip
+          import json
+          import base64
+          import boto3
+              
+          sns = boto3.client('sns')
+          ssm = boto3.client('ssm')
+          def send_sns(severity, subject, message):
+              parameter = ssm.get_parameter(Name='SNSTopicArn', WithDecryption=True)
+              subject = severity + ": " + subject
+              sns.publish(TopicArn=parameter['Parameter']['Value'], Message=message, Subject=subject)
+              
+          def lambda_handler(event, context):
+              cw_data = event['awslogs']['data']
+              compressed_payload = base64.b64decode(cw_data)
+              uncompressed_payload = gzip.decompress(compressed_payload)
+              payload = json.loads(uncompressed_payload)
+
+              log_events = payload['logEvents']
+              for log_event in log_events:
+                  print(f'LogEvent: {log_event}')
+                  if "User" in log_event["message"]:
+                      send_sns("Critical", "Password Expiring Soon", log_event["message"])
+
+      Environment:
+        Variables:
+          SNSTopic: !Ref AlertsTopicArn
+          RoleName: AlertsLambdaRole
+      Role: !GetAtt  AlertsLambdaRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+  AlertLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AlertlambdaFun
+      Principal: logs.amazonaws.com
+      SourceArn: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:var/log/pw-expiry:*
+  AlertsSubFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      DestinationArn: !GetAtt AlertlambdaFun.Arn
+      FilterPattern: ""
+      LogGroupName: var/log/pw-expiry

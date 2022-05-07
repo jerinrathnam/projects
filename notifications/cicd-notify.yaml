@@ -1,0 +1,270 @@
+
+Parameters:
+  EMail1:
+    Type: String
+    Description: Enter the required email address for sns topic.
+  EMail2:
+    Type: String
+    Description: Enter the required email address for sns topic.
+  SNSTopic1:
+    Type: String
+    Description: Enter the sns topic name.
+    Default: CodeCommitNotification1
+  SNSTopic2:
+    Type: String
+    Description: Enter the sns topic name.
+    Default: CodeCommitNotification2
+  CodeCommitARN:
+    Type: String
+    Description: Enter the CodeCommit repository's Arn
+  CodeCommitARN1:
+    Type: String
+    Description: Enter the CodeCommit repository's Arn
+  LambdaFunction:
+    Type: String
+    Description: Enter the name for the lambda function
+
+
+Resources:
+  SnsTopic1:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: !Ref SNSTopic1
+      TopicName: !Ref SNSTopic1
+      Subscription:
+        - Endpoint: !Ref EMail1
+          Protocol: email
+  SnsTopic2:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      DisplayName: !Ref SNSTopic2
+      TopicName: !Ref SNSTopic2
+      Subscription:
+        - Endpoint: !Ref EMail1
+          Protocol: email
+        - Endpoint: !Ref EMail2
+          Protocol: email
+  SNSPublisherFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Role: !GetAtt  LambdaExecutionRole.Arn
+      Code: 
+        ZipFile: |
+          import boto3
+          import os
+
+          REGION = os.getenv('AWS_REGION')
+
+          codecommit = boto3.client('codecommit')
+
+          def publish(repository, branch, message):
+              SNSTopicArn1 = os.getenv('SNS_TOPIC_ARN_1')
+              SNSTopicArn2 = os.getenv('SNS_TOPIC_ARN_2')
+              SNSClient = boto3.client('sns', region_name=REGION)
+              if branch == 'master':
+                  SNSClient.publish(
+                    TopicArn=SNSTopicArn1,
+                    Subject = 'CodeCommit Update - Repository: {0} - Branch: {1}'.format(repository, branch),
+                    Message = message
+                )
+              else:
+                  SNSClient.publish(
+                    TopicArn=SNSTopicArn2,
+                    Subject = 'CodeCommit Update - Repository: {0} - Branch: {1}'.format(repository, branch),
+                    Message = message
+                  )
+          def getFileDifferences(repository_name, lastCommitID, previousCommitID):
+              response = None
+
+              if previousCommitID != None:
+                  response = codecommit.get_differences(
+                      repositoryName=repository_name,
+                      beforeCommitSpecifier=previousCommitID,
+                      afterCommitSpecifier=lastCommitID
+                  )
+              else:
+                  # The case of getting initial commit (Without beforeCommitSpecifier)
+                  response = codecommit.get_differences(
+                      repositoryName=repository_name,
+                      afterCommitSpecifier=lastCommitID
+                  ) 
+
+              differences = []
+
+              if response == None:
+                  return differences
+
+              while "nextToken" in response:
+                  response = codecommit.get_differences(
+                      repositoryName=repository_name,
+                      beforeCommitSpecifier=previousCommitID,
+                      afterCommitSpecifier=lastCommitID,
+                      nextToken=response["nextToken"]
+                  )
+                  differences += response.get("differences", [])
+              else:
+                  differences += response["differences"]
+
+              return differences
+
+          def getDiffChangeTypeMessage(changeType):
+              type = {
+                  'M': 'Modification',
+                  'D': 'Deletion',
+                  'A': 'Addition'
+              }
+              return type[changeType]
+
+          def getLastCommitID(repository, branch="branch"):
+              response = codecommit.get_branch(
+                  repositoryName=repository,
+                  branchName=branch
+              )
+              commitId = response['branch']['commitId']
+              return commitId
+
+          def getLastCommitLog(repository, commitId):
+              response = codecommit.get_commit(
+                  repositoryName=repository,
+                  commitId=commitId
+              )
+              return response['commit']
+
+
+          def getMessageText(differences, lastCommit):
+              text = ''
+              text += 'commit ID: {0}\n'.format(lastCommit['commitId'])
+              text += 'author: {0} ({1})\n'.format(lastCommit['author']['name'], lastCommit['author']['email'])
+              text += 'message: {0}\n'.format(lastCommit['message'])
+
+              return text
+
+          def lambda_handler(event, context):
+              repository = event['resources'][0].split(':')[5]
+              print(event)
+              branch = event['detail']['referenceName']
+              if branch != 'master' and branch != 'develop':
+                return True
+              try:
+                  lastCommitID = getLastCommitID(repository, branch)
+                  lastCommit = getLastCommitLog(repository, lastCommitID)
+                  previousCommitID = None
+                  if len(lastCommit['parents']) > 0:
+                      previousCommitID = lastCommit['parents'][0]
+
+                  print('lastCommitID: {0} previousCommitID: {1}'.format(lastCommitID, previousCommitID))
+
+                  differences = getFileDifferences(repository, lastCommitID, previousCommitID)
+                  messageText = getMessageText(differences, lastCommit)
+
+                  return publish(repository, branch, messageText)
+
+              except Exception as e:
+                  print(e)
+                  print('Error getting repository {}. Make sure it exists and that your repository is in the same region as this function.'.format(repository))
+                  raise e
+
+
+      Description: CodeCommit SNS Publisher
+      MemorySize: 1028
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN_1: !Ref SnsTopic1
+          SNS_TOPIC_ARN_2: !Ref SnsTopic2
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: cicdnotifyrole
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+  RolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "allowAssumeRole"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - 'codecommit:Get*'
+              - "codecommit:List*"
+              - "codecommit:DescribePullRequestEvents"
+              - "codecommit:GitPull"
+              - "codecommit:BatchGetRepositories"
+              - "codecommit:BatchGetPullRequests"
+              - "codecommit:CancelUploadArchive"
+          - Effect: Allow
+            Resource: '*'
+            Action:
+              - 'sns:publish'
+              - 'sns:List*'
+              - 'sns:Get*'
+          - Effect: Allow
+            Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+      Roles: 
+        - !Ref "LambdaExecutionRole"
+  EventsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        {
+            "source": [
+                "aws.codecommit"
+            ],
+            "detail-type": [
+                "CodeCommit Repository State Change"
+            ],
+            "resources": [
+              !Ref CodeCommitARN,
+              !Ref CodeCommitARN1
+            ],
+            "detail": {
+                "event": [
+                "referenceCreated",
+                "referenceUpdated",
+                "referenceDeleted"
+                ]
+            }
+        }
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: !GetAtt SNSPublisherFunction.Arn
+          Id: "TargetFunctionV1"
+
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "SNSPublisherFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventsRule"
+          - "Arn"
+
+Outputs:
+    SNSPublisherFunctionArn:
+      Description: "SNS Publisher Function Arn"
+      Value: !GetAtt SNSPublisherFunction.Arn
+

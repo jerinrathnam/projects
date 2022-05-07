@@ -1,0 +1,199 @@
+Parameters:
+    CloudTrailS3BucketName:
+        Type: String
+        Description: S3 Bucket for CloudTrail
+    SNSTopicName:
+        Type: String
+        Description: Topic Name to Send Alerts
+    LambdaFunctionName:
+        Type: String
+        Description: Lambda Function Name
+    CloudTrailName:
+        Type: String
+        Description: CloudTrail Name
+    EmailId: 
+        Type: String
+        Description: Email ID for receiving alerts
+Resources:
+    CloudwatchAlerts:
+        Type: AWS::SNS::Topic
+        Properties: 
+            Subscription: 
+                - Endpoint: !Ref EmailId
+                  Protocol: "Email"
+            TopicName: !Ref SNSTopicName
+    CloudTrailS3Bucket:
+        Type: AWS::S3::Bucket
+        DeletionPolicy: Retain
+        Properties:
+            BucketName: !Ref CloudTrailS3BucketName
+    S3BucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties: 
+            Bucket: !Ref CloudTrailS3Bucket
+            PolicyDocument: 
+                Statement:
+                    - Action:
+                        - 's3:GetBucketAcl'
+                      Effect: Allow
+                      Resource: !GetAtt CloudTrailS3Bucket.Arn
+                      Principal: 
+                        Service:
+                            - cloudtrail.amazonaws.com
+                    - Action:
+                        - 's3:PutObject'
+                      Effect: Allow
+                      Resource: !Join ["/", [!GetAtt CloudTrailS3Bucket.Arn , "AWSLogs", !Ref AWS::AccountId, "*"]]
+                      Principal: 
+                        Service:
+                            - cloudtrail.amazonaws.com
+                      Condition: 
+                        StringEquals: 
+                            's3:x-amz-acl': bucket-owner-full-control
+    LambdaExecutionRole:
+        Type: 'AWS::IAM::Role'
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: 2012-10-17
+                Statement:
+                  - Effect: Allow
+                    Principal:
+                        Service:
+                        - lambda.amazonaws.com
+                    Action:
+                        - 'sts:AssumeRole'
+            Path: /
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: cloudwatch-alarm-config
+                  PolicyDocument:
+                    Version: 2012-10-17
+                    Statement:  
+                        - Effect: Allow
+                          Action:
+                            - 'events:*' 
+                            - 'cloudwatch:PutMetricAlarm'
+                            - 'cloudwatch:DeleteAlarms'
+                            - 'ec2:DescribeInstances'
+                          Resource: '*'
+    EventRule: 
+        Type: AWS::Events::Rule
+        Properties: 
+            EventPattern:
+                {
+                    "source": [
+                        "aws.ec2"
+                    ],
+                    "detail-type": [
+                        "AWS API Call via CloudTrail"
+                    ],
+                    "detail": {
+                        "eventSource": [
+                        "ec2.amazonaws.com"
+                        ],
+                        "eventName": [
+                        "RunInstances",
+                        "StopInstances",
+                        "StartInstances",
+                        "TerminateInstances"
+                        ]
+                    }
+                }
+            State: ENABLED
+            Targets:
+                - Arn: !GetAtt CloudWatchAlarmLambda.Arn
+                  Id: TargetFunctionV1
+    CloudTrail:
+        Type: AWS::CloudTrail::Trail
+        DependsOn: S3BucketPolicy
+        Properties:
+            S3BucketName: !Ref CloudTrailS3Bucket
+            IsLogging: true
+            TrailName: !Ref CloudTrailName
+    InvokePermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            FunctionName: !Ref CloudWatchAlarmLambda
+            Action: lambda:InvokeFunction
+            Principal: events.amazonaws.com
+            SourceArn: !GetAtt EventRule.Arn
+    CloudWatchAlarmLambda:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Code:
+                ZipFile: |
+                    import boto3
+                    import json
+                    import os
+                    def lambda_handler(event, context):
+                        cw = boto3.client('cloudwatch')
+                        print("EventName", event["detail"]["eventName"])
+                        eventName = event["detail"]["eventName"]
+                        instanceIds = []
+                        for instance in event["detail"]["responseElements"]["instancesSet"]["items"]:
+                            print("InstanceId", instance["InstanceId"])
+                            if eventName == "StartInstances" or eventName == "RunInstances":
+                                response = cw.put_metric_alarm(AlarmName = "WARNING: EC2 "+ instance["InstanceId"] + " DISK utilization above 75%",
+                                            AlarmDescription="WARNING: EC2 "+ instance["InstanceId"] + " DISK utilization above 75%",
+                                            ActionsEnabled=True,
+                                            AlarmActions=[os.getenv('SNSTOPIC')],
+                                            OKActions=[os.getenv('SNSTOPIC')],
+                                            MetricName='disk_used_percent',
+                                            Namespace='CWAgent',
+                                            Statistic='Average',
+                                            Dimensions=[{'Name': "InstanceId",'Value': instance["InstanceId"]}, 
+                                                        {'Name': "device",'Value': "xvda1"}, 
+                                                        {'Name': "path",'Value': "/"},
+                                                        {'Name': "fstype",'Value': "xfs"},
+                                                        {'Name': "ImageId", 'Value': instance["ImageId"]},
+                                                        {'Name': "InstanceType", 'Value': instance["InstanceType"]}],
+                                            Period=300,
+                                            EvaluationPeriods=3,
+                                            Threshold=75.0,
+                                            ComparisonOperator='GreaterThanOrEqualToThreshold')
+                                response1 = cw.put_metric_alarm(AlarmName = "CRITICAL: EC2 "+ instance["InstanceId"] + " DISK utilization above 80%",
+                                            AlarmDescription= "CRITICAL: EC2 "+ instance["InstanceId"] + " DISK utilization above 80%",
+                                            ActionsEnabled=True,
+                                            AlarmActions=[os.getenv('SNSTOPIC')],
+                                            OKActions=[os.getenv('SNSTOPIC')],
+                                            MetricName='disk_used_percent',
+                                            Namespace='CWAgent',
+                                            Statistic='Average',
+                                            Dimensions=[{'Name': "InstanceId",'Value': instance["InstanceId"]}, 
+                                                        {'Name': "device",'Value': "xvda1"}, 
+                                                        {'Name': "path",'Value': "/"},
+                                                        {'Name': "fstype",'Value': "xfs"},
+                                                        {'Name': "ImageId", 'Value': instance["ImageId"]},
+                                                        {'Name': "InstanceType", 'Value': instance["InstanceType"]}],
+                                            Period=300,
+                                            EvaluationPeriods=3,
+                                            Threshold=80.0,
+                                            ComparisonOperator='GreaterThanOrEqualToThreshold')
+                            elif eventName == "StopInstances" or eventName == "TerminateInstances":
+                                ec2 = boto3.client('ec2')
+                                ec2_inst = ec2.describe_instances()
+                                for reservation in ec2_inst["Reservations"]:
+                                    for instance in reservation["Instances"]:
+                                        print("InstanceId", instance["InstanceId"])
+                                response = cw.delete_alarms(
+                                                AlarmNames=[
+                                                    "WARNING: EC2 " + instance["InstanceId"] + " DISK utilization above 75%",
+                                                    "CRITICAL: EC2 " + instance["InstanceId"] + " DISK utilization above 80%"
+                                                ]
+                                            )
+                        # TODO implement
+                        return {
+                            'statusCode': 200,
+                            'body': json.dumps('Success!')
+                        }
+
+            FunctionName: !Ref LambdaFunctionName
+            Handler: "index.lambda_handler"
+            Role: !GetAtt LambdaExecutionRole.Arn
+            Runtime: "python3.7"
+            Timeout: 10
+            Environment:
+                Variables:
+                    SNSTOPIC: !Ref CloudwatchAlerts
+            

@@ -1,0 +1,185 @@
+Parameters:
+  CrontabSchedule:
+    Type: String
+    Description: Enter the required cron tab.
+    Default: cron(40 13 * * ? *)
+  SgID:
+    Type: String
+    Description: Enter the required security Group ID.
+  SubnetID:
+    Type: String
+    Description: Enter the required subnet ID.
+  KMSId:
+    Type: String
+    Description: Enter the required KMS ID.
+  EMail:
+    Type: String
+    Description: Enter the email id .
+  SNSTopic:
+    Type: String
+    Description: Enter the sns topic name.
+  LambdaFunction:
+    Type: String
+    Description: Enter the name for the lambda function
+  Domain1:
+    Type: String
+    Description: Enter the name for the domain
+  Domain2:
+    Type: String
+    Description: Enter the name for the domain
+  Domain3:
+    Type: String
+    Description: Enter the name for the domain
+Resources:
+  SnsTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      KmsMasterKeyId: !Ref KMSId
+      DisplayName: !Ref SNSTopic
+      TopicName: !Ref SNSTopic
+      Subscription:
+        - Endpoint: !Ref EMail
+          Protocol: email
+  SNSPublisherFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Handler: index.ssl_expires_in
+      Runtime: python3.7
+      Role: !GetAtt  LambdaExecutionRole.Arn
+      Code: 
+        ZipFile: |
+          import socket
+          import ssl
+          import datetime
+          import boto3
+          import os
+
+          domain1 = os.getenv('DOMAIN_1')
+          domain2 = os.getenv('DOMAIN_2')
+          domain3 = os.getenv('DOMAIN_3')
+          domains = [domain1, domain2, domain3]
+          def ssl_expiry_datetime(hostname):
+            ssl_date_fmt = r'%b %d %H:%M:%S %Y %Z'
+
+            context = ssl.create_default_context()
+            conn = context.wrap_socket(
+                socket.socket(socket.AF_INET),
+                server_hostname=hostname,
+            )
+            # 3 second timeout because Lambda has runtime limitations
+            conn.settimeout(10.0)
+
+            conn.connect((hostname, 443))
+            ssl_info = conn.getpeercert()
+            # parse the string from the certificate into a Python datetime object
+            return datetime.datetime.strptime(ssl_info['notAfter'], ssl_date_fmt)
+
+
+          def ssl_valid_time_remaining(hostname):
+            """Get the number of days left in a cert's lifetime."""
+            expires = ssl_expiry_datetime(hostname)
+            return expires - datetime.datetime.utcnow()
+
+          sns = boto3.client('sns')
+          def sns_Alert(domain, rday, sslStatus):
+              sslStat = 'Domain name : ' + domain + ' SSL certificate will be expired in ' + rday +' days!! '
+              snsSub = 'Domain name : ' + domain + ' SSL Certificate Expiry ' + sslStatus + ' alert'
+              #print (sslStat)
+              #print (snsSub)
+              SNSTopicArn = os.getenv('SNS_TOPIC_ARN')
+              response = sns.publish(
+              TargetArn=SNSTopicArn,
+              Message= sslStat,
+              Subject= snsSub
+              )
+
+          def ssl_expires_in(event, context):
+            for domain in domains:
+                print(domain)
+                remaining = ssl_valid_time_remaining(domain)
+                rday = remaining.days
+                print(rday)
+                #print(remaining.days)
+                if rday == datetime.timedelta(days=90).days:
+                  sns_Alert(domain, str(rday), 'warning')
+                elif rday == datetime.timedelta(days=60).days:
+                  sns_Alert(domain, str(rday), 'Warning')
+                elif rday == datetime.timedelta(days=30).days:
+                  sns_Alert(domain, str(rday), 'Critical')
+                elif rday < datetime.timedelta(days=14).days:
+                  sns_Alert(domain, str(rday), 'Critical') 
+
+
+      Description: ssl certificate expiry alert SNS Publisher
+      MemorySize: 1028
+      Timeout: 300
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SnsTopic
+          DOMAIN_1: !Ref Domain1
+          DOMAIN_2: !Ref Domain2
+          DOMAIN_3: !Ref Domain3
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SgID
+        SubnetIds:
+          - !Ref SubnetID
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: ssl_expiry_alerts_role
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: "ssl_expiry_alerts_poicy"
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - 'sns:publish'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: "*"
+  EventsRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: !Ref CrontabSchedule
+      State: ENABLED
+      Targets: 
+        - 
+          Arn: !GetAtt SNSPublisherFunction.Arn
+          Id: "TargetFunctionV1"
+
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "SNSPublisherFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "EventsRule"
+          - "Arn"
+    
+
