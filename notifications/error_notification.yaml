@@ -1,0 +1,118 @@
+Parameters:
+  LogGroupName:
+    Type: AWS::SSM::Parameter::Value<String>
+  AlertsTopicArn:
+    Type: AWS::SSM::Parameter::Value<String> 
+  LogGroupArn:
+    Type: AWS::SSM::Parameter::Value<String>  
+
+Resources:
+  AlertsLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: AlertsLambdaRole
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+        - 
+          Effect: "Allow"
+          Principal: 
+            Service: 
+              - "lambda.amazonaws.com"
+          Action: 
+            - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+  RolePolicies: 
+    Type: "AWS::IAM::Policy"
+    Properties: 
+      PolicyName: "allowAssumeRole"
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Action: "sns:Publish"
+            Resource: !Ref AlertsTopicArn
+          - Effect: "Allow"
+            Action: "sts:AssumeRole"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "logs:PutSubscriptionFilter"
+            Resource: !Ref LogGroupArn
+          - Effect: "Allow"
+            Action:
+              - "ssm:GetParametersByPath"
+              - "ssm:GetParameter"
+              - "ssm:DescribeParameters"
+              - "ssm:GetParameters"
+            Resource: "*"
+      Roles: 
+        - !Ref "AlertsLambdaRole"
+  AlertlambdaFun: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      FunctionName: AlertLambdaFunction
+      Code: 
+        ZipFile: |
+          import gzip
+          import json
+          import base64
+          import boto3
+              
+          sns = boto3.client('sns')
+          client = boto3.client('ssm')
+          def send_sns(severity, subject, message):
+              parameter = client.get_parameter(Name='SnsTopicArn', WithDecryption=True)
+              subject = severity + ": " + subject
+              sns.publish(TopicArn=parameter['Parameter']['Value'], Message=message, Subject=subject)
+              
+          def lambda_handler(event, context):
+              cw_data = event['awslogs']['data']
+              compressed_payload = base64.b64decode(cw_data)
+              uncompressed_payload = gzip.decompress(compressed_payload)
+              payload = json.loads(uncompressed_payload)
+
+              log_events = payload['logEvents']
+              for log_event in log_events:
+                  print(f'LogEvent: {log_event}')
+                  if "XDMP-FORESTINCRBACKUPFAILED" in log_event["message"]:
+                      send_sns("Critical", "Incremental Backup Failed", log_event["message"])
+                  if "XDMP-FORESTBACKUPFAILED" in log_event["message"]:
+                      send_sns("Critical", "Backup Failed", log_event["message"])
+                  if "XDMP-BACKUPNOTFOUND" in log_event["message"]:
+                      send_sns("Critical", "Incorrect Backup Configuration", log_event["message"])
+                  if "XDMP-NODIR" in log_event["message"]:
+                      send_sns("Critical", "Incorrect Backup Configuration", log_event["message"])
+                  if "Error:" in log_event["message"]:
+                      send_sns("Critical", "Generic error log message capture", log_event["message"])
+                  if "Slow send" in log_event["message"]:
+                      send_sns("High", "Potential network issue", log_event["message"])
+                  if "XDMP-CLOCK-SKEW" in log_event["message"]:
+                      send_sns("High", "Potential disk issue", log_event["message"])
+                  if "Slow fsync" in log_event["message"]:
+                      send_sns("High", "Potential network issue", log_event["message"])
+                  if "Warning:" in log_event["message"]:
+                      send_sns("Medium", "Generic warning log message capture", log_event["message"])
+      Environment:
+        Variables:
+          SNSTopic: !Ref AlertsTopicArn
+          RoleName: AlertsLambdaRole
+      Role: !GetAtt  AlertsLambdaRole.Arn
+      Handler: index.lambda_handler
+      Runtime: python3.7
+      Timeout: 300
+  AlertLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties: 
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AlertlambdaFun
+      Principal: logs.amazonaws.com
+      SourceArn: !Ref LogGroupArn
+  AlertsSubFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties: 
+      DestinationArn: !GetAtt AlertlambdaFun.Arn
+      FilterPattern: '?"XDMP-FORESTINCRBACKUPFAILED" ?"XDMP-FORESTBACKUPFAILED" ?"XDMP-BACKUPNOTFOUND" ?"XDMP-NODIR" ?"Error:" ?"Slow send" ?"XDMP-CLOCK-SKEW" ?"Slow fsync" ?"Warning:"'
+      LogGroupName: !Ref LogGroupName
