@@ -3,16 +3,7 @@ provider "aws" {
   shared_credentials_files = ["C:/Users/jerin/.aws/credentials"]
   profile                  = "jerin"
 }
-########################### LAMBDA FUNCTION  ##############################################
 
-resource "aws_lambda_function" "api_gateway" {
-  filename      = "index.zip"
-  function_name = "APIGateway_Lambda"
-  role          = "arn:aws:iam::387232581030:role/lambda-basic"
-  handler       = "index.lambda_handler"
-
-  runtime = "python3.9"
-}
 ########################### LAMBDA FUNCTION  ##############################################
 
 
